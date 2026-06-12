@@ -1,11 +1,38 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
+const https = require('https');
+const { spawnSync } = require('child_process');
 
 const CONFIG_PATH = path.join(os.homedir(), '.git-brain.json');
-const DEFAULT_MODEL = 'gemini-1.5-pro';
+const DEFAULT_PROVIDER = 'gemini';
+const PROVIDERS = ['gemini', 'openrouter'];
+const DEFAULT_MODELS = {
+  gemini: 'gemini-2.5-pro',
+  openrouter: 'gpt-4o-mini',
+};
+const FALLBACK_MODELS = {
+  gemini: [
+    'gemini-2.5-pro',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-001',
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash-lite-001',
+    'gemini-3.1-flash-lite',
+  ],
+  openrouter: [
+    'gpt-4o-mini',
+    'gpt-4o',
+    'mistral-7b-instruct',
+    'mistral-7b',
+  ],
+};
 const DEFAULT_STYLE = 'conventional';
+const MAX_PROMPT_DIFF_CHARS = 120000;
+const MAX_PROMPT_DIFF_HEAD_LINES = 180;
+const MAX_PROMPT_DIFF_TAIL_LINES = 60;
 
 function loadConfig() {
   try {
@@ -21,14 +48,59 @@ function saveConfig(config) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
 }
 
-function resolveApiKey() {
+function resolveProvider(options = {}) {
   const config = loadConfig();
+  const provider = options.provider || process.env.GIT_BRAIN_PROVIDER || config.provider || DEFAULT_PROVIDER;
+  return String(provider).toLowerCase();
+}
+
+function resolveApiKey(provider) {
+  const config = loadConfig();
+  if (provider === 'openrouter') {
+    return process.env.OPENROUTER_API_KEY || config.openRouterApiKey || config.apiKey || null;
+  }
+
   return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || config.apiKey || null;
+}
+
+function resolveModel(provider, options = {}) {
+  const config = loadConfig();
+  if (options.model) return options.model;
+
+  if (provider === 'openrouter') {
+    return process.env.OPENROUTER_MODEL || config.model || DEFAULT_MODELS.openrouter;
+  }
+
+  return process.env.GENERATIVE_MODEL || process.env.GEMINI_MODEL || config.model || DEFAULT_MODELS.gemini;
+}
+
+function runGit(args, options = {}) {
+  const result = spawnSync('git', args, {
+    encoding: 'utf8',
+    shell: false,
+    windowsHide: true,
+    maxBuffer: 10 * 1024 * 1024,
+    ...options,
+  });
+
+  if (result.error) {
+    if (result.error.code === 'ENOBUFS') {
+      throw new Error('Git command failed due to a large output buffer. Try staging fewer changes or use a smaller diff.');
+    }
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    const message = result.stderr ? result.stderr.toString().trim() : `git ${args.join(' ')} failed`;
+    throw new Error(message);
+  }
+
+  return result.stdout.trim();
 }
 
 function getBranchName() {
   try {
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
+    const branch = runGit(['rev-parse', '--abbrev-ref', 'HEAD']);
     return branch || 'unknown-branch';
   } catch (error) {
     return 'unknown-branch';
@@ -37,7 +109,7 @@ function getBranchName() {
 
 function getStagedDiff() {
   try {
-    const diff = execSync('git diff --staged --no-color', { encoding: 'utf8' }).trim();
+    const diff = runGit(['diff', '--staged', '--no-color']);
     if (!diff) {
       throw new Error('No staged changes found. Stage files before running git-brain commit.');
     }
@@ -47,14 +119,34 @@ function getStagedDiff() {
   }
 }
 
+function truncateDiff(diff) {
+  if (!diff || diff.length <= MAX_PROMPT_DIFF_CHARS) {
+    return diff;
+  }
+
+  const lines = diff.split(/\r?\n/);
+  if (lines.length <= MAX_PROMPT_DIFF_HEAD_LINES + MAX_PROMPT_DIFF_TAIL_LINES) {
+    return diff.slice(0, MAX_PROMPT_DIFF_CHARS);
+  }
+
+  const head = lines.slice(0, MAX_PROMPT_DIFF_HEAD_LINES);
+  const tail = lines.slice(-MAX_PROMPT_DIFF_TAIL_LINES);
+  return `${head.join('\n')}
+
+...TRUNCATED DIFF: only the first ${MAX_PROMPT_DIFF_HEAD_LINES} lines and last ${MAX_PROMPT_DIFF_TAIL_LINES} lines are included...
+
+${tail.join('\n')}`;
+}
+
 function buildPrompt(diff, branch, style) {
+  const cleanedDiff = truncateDiff(diff);
   const base = `You are an expert git commit assistant. Generate 3 distinct professional commit messages based on the following staged diff. Use a ${style} commit style if possible and keep them concise.
 Return the result as a strict JSON array of strings. Do not include markdown code blocks, just the raw JSON array.
 
 Branch: ${branch}
 
 Diff:
-${diff}`;
+${cleanedDiff}`;
   return base;
 }
 
@@ -74,34 +166,159 @@ function extractMessage(result) {
   }
 }
 
-async function queryGemini(diff, branch, style, apiKey) {
+function getModelCandidates(provider, initialModel) {
+  const providerFallbacks = FALLBACK_MODELS[provider] || [];
+  const candidates = [initialModel, ...providerFallbacks.filter((model) => model !== initialModel)];
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function shouldFallbackToOpenRouter(error) {
+  const message = String(error.message || '').toLowerCase();
+  return /too many requests|rate limit|quota exceeded|not found|unsupported|invalid model|unknown model|did not include|no output|no response|request failed/.test(message);
+}
+
+async function queryGeminiModel(diff, branch, style, apiKey, model) {
   const { GoogleGenerativeAI } = require('@google/generative-ai');
-  const ora = require('ora');
+  const client = new GoogleGenerativeAI(apiKey);
+  const prompt = buildPrompt(diff, branch, style);
 
-  const spinner = ora('Generating commit messages with Gemini...').start();
+  const request = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { maxOutputTokens: 500, temperature: 0.4 },
+  };
 
-  try {
-    const client = new GoogleGenerativeAI(apiKey);
-    const model = client.getGenerativeModel({ model: DEFAULT_MODEL });
-    const prompt = buildPrompt(diff, branch, style);
-    
-    const request = {
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 500, temperature: 0.4 }
+  const modelInstance = client.getGenerativeModel({ model }, { apiVersion: 'v1' });
+  const response = await modelInstance.generateContent(request);
+  return extractMessage(response);
+}
+
+function openRouterRequest(url, body, apiKey) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const requestBody = JSON.stringify(body);
+
+    const options = {
+      method: 'POST',
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(requestBody, 'utf8'),
+      },
     };
-    
-    const response = await model.generateContent(request);
-    spinner.succeed('Commit messages generated.');
-    return extractMessage(response);
-  } catch (error) {
-    spinner.fail('Failed to generate commit messages.');
-    throw error;
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { responseData += chunk; });
+      res.on('end', () => {
+        const result = {
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          text: async () => responseData,
+          json: async () => {
+            try {
+              return JSON.parse(responseData);
+            } catch (err) {
+              throw new Error(`Invalid JSON response from OpenRouter: ${err.message}`);
+            }
+          },
+        };
+
+        if (result.ok) {
+          resolve(result);
+        } else {
+          reject(new Error(`OpenRouter request failed: HTTP ${res.statusCode} ${res.statusMessage} - ${responseData}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+async function queryOpenRouterModel(diff, branch, style, apiKey, model) {
+  const prompt = buildPrompt(diff, branch, style);
+  const url = 'https://openrouter.ai/api/v1/chat/completions';
+  const requestBody = {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.4,
+    max_tokens: 500,
+  };
+
+  const response = await openRouterRequest(url, requestBody, apiKey);
+  const data = await response.json();
+
+  const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text;
+  if (!content) {
+    throw new Error('OpenRouter response did not include a model output.');
   }
+
+  return extractMessage({ response: { text: () => String(content) } });
+}
+
+async function generateCommitMessages(provider, diff, branch, style, apiKey, model) {
+  const oraPkg = require('ora');
+  const ora = oraPkg.default || oraPkg;
+  const spinner = ora(`Generating commit messages with ${provider}...`).start();
+  const candidates = getModelCandidates(provider, model);
+  let lastError = null;
+
+  for (const candidateModel of candidates) {
+    try {
+      spinner.text = `Generating commit messages with ${provider} model ${candidateModel}...`;
+      const generated = provider === 'openrouter'
+        ? await queryOpenRouterModel(diff, branch, style, apiKey, candidateModel)
+        : await queryGeminiModel(diff, branch, style, apiKey, candidateModel);
+
+      spinner.succeed(`Commit messages generated with ${provider} model ${candidateModel}.`);
+      return generated;
+    } catch (error) {
+      lastError = error;
+      const message = String(error.message || '');
+      const isRateLimit = /Too Many Requests|rate limit|quota exceeded/i.test(message);
+      const isNotFound = /not found|unsupported|invalid model|unknown model/i.test(message);
+      const isLastCandidate = candidateModel === candidates[candidates.length - 1];
+
+      if (isLastCandidate || (!isRateLimit && !isNotFound)) {
+        if (provider === 'gemini') {
+          const openRouterKey = resolveApiKey('openrouter');
+          if (openRouterKey && shouldFallbackToOpenRouter(error)) {
+            spinner.succeed('All Gemini model attempts failed. Switching to OpenRouter fallback...');
+            const openRouterModel = resolveModel('openrouter');
+            return await generateCommitMessages('openrouter', diff, branch, style, openRouterKey, openRouterModel);
+          }
+        }
+
+        spinner.fail('Failed to generate commit messages.');
+        if (isRateLimit) {
+          throw new Error('Quota exceeded. Wait a few seconds and try again, or set a lower-cost model.');
+        }
+        throw error;
+      }
+
+      spinner.text = `Model ${candidateModel} failed; trying fallback model...`;
+    }
+  }
+
+  spinner.fail('Failed to generate commit messages.');
+  throw lastError || new Error('Unable to generate commit messages.');
 }
 
 async function runCommit(message) {
   try {
-    execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { stdio: 'inherit' });
+    const result = spawnSync('git', ['commit', '-m', message], { stdio: 'inherit', shell: false });
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.status !== 0) {
+      throw new Error('Git commit failed. Make sure your repository is clean and the staged diff still exists.');
+    }
   } catch (error) {
     throw new Error('Git commit failed. Make sure your repository is clean and the staged diff still exists.');
   }
@@ -109,10 +326,20 @@ async function runCommit(message) {
 
 async function handleCommit(options) {
   const inquirer = require('inquirer');
-  const apiKey = resolveApiKey();
+  const provider = resolveProvider(options);
+
+  if (!PROVIDERS.includes(provider)) {
+    console.error(`Error: Unsupported provider '${provider}'. Use 'gemini' or 'openrouter'.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const apiKey = resolveApiKey(provider);
   if (!apiKey) {
-    console.error('Error: Gemini API key not found. Run `git-brain config --key <API_KEY>` or set GEMINI_API_KEY.');
-    process.exit(1);
+    console.error(`Error: ${provider === 'openrouter' ? 'OpenRouter' : 'Gemini'} API key not found. ` +
+      `Run \`git-brain config --provider ${provider} --key <API_KEY>\` or set ${provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'GEMINI_API_KEY'}.`);
+    process.exitCode = 1;
+    return;
   }
 
   let diff;
@@ -120,18 +347,21 @@ async function handleCommit(options) {
     diff = getStagedDiff();
   } catch (error) {
     console.error(`Error: ${error.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const branch = getBranchName();
   const style = options.style || DEFAULT_STYLE;
+  const model = resolveModel(provider, options);
 
   let generated;
   try {
-    generated = await queryGemini(diff, branch, style, apiKey);
+    generated = await generateCommitMessages(provider, diff, branch, style, apiKey, model);
   } catch (error) {
     console.error(`Error: ${error.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   let selectedMessage;
@@ -186,17 +416,106 @@ async function handleConfig(options) {
   const inquirer = require('inquirer');
   const config = loadConfig();
 
-  if (options.key) {
-    config.apiKey = options.key;
-    saveConfig(config);
-    console.log(`Saved Gemini API key to ${CONFIG_PATH}`);
+  const provider = (options.provider || config.provider || DEFAULT_PROVIDER).toLowerCase();
+  if (!PROVIDERS.includes(provider)) {
+    console.error(`Error: Unsupported provider '${options.provider}'. Use 'gemini' or 'openrouter'.`);
+    process.exitCode = 1;
     return;
   }
 
-  const { apiKey } = await inquirer.prompt([{ type: 'password', name: 'apiKey', message: 'Enter your Gemini API key:', mask: '*', validate: (value) => Boolean(value) || 'API key is required.' }]);
-  config.apiKey = apiKey;
+  const isProviderKeyMode = Boolean(options.key) || Boolean(options.geminiKey) || Boolean(options.openrouterKey);
+
+  if (isProviderKeyMode) {
+    if (options.key) {
+      if (provider === 'openrouter') {
+        config.openRouterApiKey = options.key;
+      } else {
+        config.apiKey = options.key;
+      }
+    }
+
+    if (options.geminiKey) {
+      config.apiKey = options.geminiKey;
+    }
+
+    if (options.openrouterKey) {
+      config.openRouterApiKey = options.openrouterKey;
+    }
+
+    if (options.provider) {
+      config.provider = provider;
+    }
+
+    if (options.model) {
+      config.model = options.model;
+    }
+
+    saveConfig(config);
+
+    const savedKeys = [];
+    if (options.key) savedKeys.push(`${provider} key`);
+    if (options.geminiKey) savedKeys.push('Gemini key');
+    if (options.openrouterKey) savedKeys.push('OpenRouter key');
+    console.log(`Saved ${savedKeys.join(' and ')} to ${CONFIG_PATH}`);
+    return;
+  }
+
+  const answers = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'provider',
+      message: 'Which provider do you want to use?',
+      choices: PROVIDERS,
+      default: provider,
+    },
+    {
+      type: 'password',
+      name: 'apiKey',
+      message: (answers) => `Enter your ${answers.provider === 'openrouter' ? 'OpenRouter' : 'Gemini'} API key:`,
+      mask: '*',
+      validate: (value) => Boolean(value) || 'API key is required.',
+    },
+    {
+      type: 'input',
+      name: 'model',
+      message: 'Optional model name (press enter to use default):',
+      default: (answers) => answers.provider === 'openrouter' ? DEFAULT_MODELS.openrouter : DEFAULT_MODELS.gemini,
+    },
+    {
+      type: 'confirm',
+      name: 'addOtherKey',
+      message: 'Would you like to configure the other provider API key as well?',
+      default: false,
+    },
+    {
+      type: 'password',
+      name: 'otherApiKey',
+      message: (answers) => answers.provider === 'openrouter'
+        ? 'Enter your Gemini API key:'
+        : 'Enter your OpenRouter API key:',
+      when: (answers) => answers.addOtherKey,
+      mask: '*',
+      validate: (value) => Boolean(value) || 'API key is required.',
+    },
+  ]);
+
+  config.provider = answers.provider;
+  config.model = answers.model || DEFAULT_MODELS[answers.provider];
+
+  if (answers.provider === 'openrouter') {
+    config.openRouterApiKey = answers.apiKey;
+    if (answers.addOtherKey) {
+      config.apiKey = answers.otherApiKey;
+    }
+  } else {
+    config.apiKey = answers.apiKey;
+    if (answers.addOtherKey) {
+      config.openRouterApiKey = answers.otherApiKey;
+    }
+  }
+
   saveConfig(config);
-  console.log(`Saved Gemini API key to ${CONFIG_PATH}`);
+  console.log(`Saved ${answers.provider} API key to ${CONFIG_PATH}`);
 }
 
 async function main() {
@@ -211,6 +530,8 @@ async function main() {
   program.command('commit')
     .description('Generate a commit message for staged changes')
     .option('-s, --style <style>', 'commit style: conventional or emoji', DEFAULT_STYLE)
+    .option('-p, --provider <provider>', 'AI provider: gemini or openrouter', DEFAULT_PROVIDER)
+    .option('--model <model>', 'Override the model name to use')
     .option('--no-commit', 'do not run git commit, only generate the message')
     .action(async (options) => {
       await handleCommit(options);
@@ -218,7 +539,11 @@ async function main() {
 
   program.command('config')
     .description('Store Git-Brain settings locally')
-    .option('--key <key>', 'Gemini API key to save')
+    .option('--provider <provider>', 'Provider to configure: gemini or openrouter')
+    .option('--model <model>', 'Optional default model name for the configured provider')
+    .option('--key <key>', 'API key to save for the selected provider')
+    .option('--gemini-key <key>', 'Gemini API key to save')
+    .option('--openrouter-key <key>', 'OpenRouter API key to save')
     .action(async (options) => {
       await handleConfig(options);
     });
@@ -249,7 +574,6 @@ module.exports = {
   getBranchName,
   getStagedDiff,
   resolveApiKey,
-  queryGemini,
   runCommit,
   handleCommit,
   handleConfig,
