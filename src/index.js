@@ -2,10 +2,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
-const { Command } = require('commander');
-const inquirer = require('inquirer');
-const ora = require('ora');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const CONFIG_PATH = path.join(os.homedir(), '.git-brain.json');
 const DEFAULT_MODEL = 'gemini-1.5-pro';
@@ -52,42 +48,53 @@ function getStagedDiff() {
 }
 
 function buildPrompt(diff, branch, style) {
-  const base = `You are an expert git commit assistant. Generate a single professional commit message based on the following staged diff. Use a ${style} commit style if possible and keep it concise.
+  const base = `You are an expert git commit assistant. Generate 3 distinct professional commit messages based on the following staged diff. Use a ${style} commit style if possible and keep them concise.
+Return the result as a strict JSON array of strings. Do not include markdown code blocks, just the raw JSON array.
 
 Branch: ${branch}
 
 Diff:
-${diff}
-
-Commit message:`;
+${diff}`;
   return base;
 }
 
 function extractMessage(result) {
-  if (!result || !result.response || !result.response.candidates || !result.response.candidates.length) {
-    throw new Error('Gemini returned an unexpected response format.');
+  try {
+    const text = result.response.text().trim();
+    let jsonStr = text.replace(/^```(json)?\r?\n?/, '').replace(/\r?\n?```$/, '');
+    jsonStr = jsonStr.replace(/\\n/g, '\n');
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed;
+    }
+    return [text];
+  } catch (err) {
+    // Fallback if not valid JSON
+    return [result.response.text().trim()];
   }
-
-  const candidate = result.response.candidates[0];
-  if (!candidate || !candidate.content || !candidate.content.parts) {
-    throw new Error('Gemini response did not contain content parts.');
-  }
-
-  return candidate.content.parts.map((part) => String(part)).join('').trim();
 }
 
 async function queryGemini(diff, branch, style, apiKey) {
-  const spinner = ora('Generating commit message with Gemini...').start();
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  const ora = require('ora');
+
+  const spinner = ora('Generating commit messages with Gemini...').start();
 
   try {
     const client = new GoogleGenerativeAI(apiKey);
     const model = client.getGenerativeModel({ model: DEFAULT_MODEL });
     const prompt = buildPrompt(diff, branch, style);
-    const response = await model.generateContent({ contents: [{ role: 'user', parts: [prompt] }] }, { generationConfig: { maxOutputTokens: 200, temperature: 0.2 } });
-    spinner.succeed('Commit message generated.');
+    
+    const request = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 500, temperature: 0.4 }
+    };
+    
+    const response = await model.generateContent(request);
+    spinner.succeed('Commit messages generated.');
     return extractMessage(response);
   } catch (error) {
-    spinner.fail('Failed to generate commit message.');
+    spinner.fail('Failed to generate commit messages.');
     throw error;
   }
 }
@@ -101,6 +108,7 @@ async function runCommit(message) {
 }
 
 async function handleCommit(options) {
+  const inquirer = require('inquirer');
   const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error('Error: Gemini API key not found. Run `git-brain config --key <API_KEY>` or set GEMINI_API_KEY.');
@@ -126,8 +134,22 @@ async function handleCommit(options) {
     process.exit(1);
   }
 
-  console.log('\nGenerated commit message:\n');
-  console.log(generated);
+  let selectedMessage;
+  if (Array.isArray(generated) && generated.length > 1) {
+    const choices = generated.map(msg => ({ name: msg, value: msg }));
+    const { choice } = await inquirer.prompt([{
+      type: 'list',
+      name: 'choice',
+      message: 'Select a commit message:',
+      choices
+    }]);
+    selectedMessage = choice;
+  } else {
+    selectedMessage = Array.isArray(generated) ? generated[0] : generated;
+  }
+
+  console.log('\nSelected commit message:\n');
+  console.log(selectedMessage);
   console.log('');
 
   const { decision } = await inquirer.prompt([{ type: 'list', name: 'decision', message: 'Accept this commit message?', choices: [
@@ -137,7 +159,7 @@ async function handleCommit(options) {
   ] }]);
 
   if (decision === 'edit') {
-    const { edited } = await inquirer.prompt([{ type: 'input', name: 'edited', message: 'Enter the commit message:', default: generated }]);
+    const { edited } = await inquirer.prompt([{ type: 'input', name: 'edited', message: 'Enter the commit message:', default: selectedMessage }]);
     if (!edited || !edited.trim()) {
       console.error('Commit message cannot be empty. Aborting.');
       process.exit(1);
@@ -153,7 +175,7 @@ async function handleCommit(options) {
       console.log('Auto-commit skipped due to --no-commit.');
       return;
     }
-    await runCommit(generated);
+    await runCommit(selectedMessage);
     return;
   }
 
@@ -161,6 +183,7 @@ async function handleCommit(options) {
 }
 
 async function handleConfig(options) {
+  const inquirer = require('inquirer');
   const config = loadConfig();
 
   if (options.key) {
@@ -177,6 +200,7 @@ async function handleConfig(options) {
 }
 
 async function main() {
+  const { Command } = require('commander');
   const program = new Command();
 
   program
@@ -206,7 +230,29 @@ async function main() {
   await program.parseAsync(process.argv);
 }
 
-main().catch((error) => {
-  console.error(`Unexpected error: ${error.message}`);
-  process.exit(1);
-});
+async function run() {
+  try {
+    await main();
+  } catch (error) {
+    console.error(`Unexpected error: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  run();
+}
+
+module.exports = {
+  buildPrompt,
+  extractMessage,
+  getBranchName,
+  getStagedDiff,
+  resolveApiKey,
+  queryGemini,
+  runCommit,
+  handleCommit,
+  handleConfig,
+  main,
+  run,
+};

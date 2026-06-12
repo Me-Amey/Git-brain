@@ -8,16 +8,25 @@
   },
   "scripts": {
     "start": "node ./src/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest"
   },
-  "keywords": ["git", "commit", "cli", "ai", "gemini"],
+  "keywords": [
+    "git",
+    "commit",
+    "cli",
+    "ai",
+    "gemini"
+  ],
   "author": "",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
-    "commander": "^15.0.0",
-    "inquirer": "^14.0.2",
+    "commander": "^14.0.0",
+    "inquirer": "^8.2.5",
     "ora": "^9.4.0"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2"
   }
 }
